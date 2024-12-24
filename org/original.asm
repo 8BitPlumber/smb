@@ -423,11 +423,15 @@ IncMsgCounter: lda SecondaryMsgCounter
                sta PrimaryMsgCounter
                cmp #$07                      ;check primary counter one more time
 SetEndTimer:   bcc ExitMsgs                  ;if not reached value yet, branch to leave
-               jsr Enter_RedrawAll
+               jsr worldendtimer_6
                lda #$06
                sta WorldEndTimer             ;otherwise set world end timer
 IncModeTask_A: inc OperMode_Task             ;move onto next task in mode
 ExitMsgs:      rts                           ;leave
+worldendtimer_6: ; $F0D9
+lda WRAM_Timer+1
+bpl worldendtimer_6_add
+jmp Enter_RedrawAll
 
 ;-------------------------------------------------------------------------------------
 
@@ -1411,10 +1415,22 @@ ChkOverR: ldy JoypadOverride          ;if controller bits not set, branch to ski
 ChkSwimE: ldy AreaType                ;if level not water-type,
           bne SetPESub                ;skip this subroutine
           jsr SetupBubble             ;otherwise, execute sub to set up air bubbles
-SetPESub: lda #$07                    ;set to run player entrance subroutine
-          sta GameEngineSubroutine    ;on the next frame of game engine
+SetPESub: jsr ges_7                    ;set to run player entrance subroutine
+          ;sta GameEngineSubroutine    ;on the next frame of game engine
           StatusbarUpdate SB_Frame
           rts
+.byte $ff
+ges_7: ;$F089
+lda #$07                    ;set to run player entrance subroutine
+sta GameEngineSubroutine    ;on the next frame of game engine
+lda WRAM_Timer+1
+bmi ges_7_dont_add
+lda AreaPointer
+cmp #$29 ;#$29 is pipe intro
+beq ges_7_add
+
+ges_7_dont_add:
+rts
 
 ;-------------------------------------------------------------------------------------
 
@@ -5235,7 +5251,7 @@ HandlePipeEntry:
          sta ChangeAreaTimer       ;set timer for change of area
          lda #$03
          sta GameEngineSubroutine  ;set to run vertical pipe entry routine on next frame
-         jsr Enter_RedrawAll
+         jsr jsr ges_3
          lda #Sfx_PipeDown_Injury
          sta Square1SoundQueue     ;load pipedown/injury sound
          lda #%00100000
@@ -5253,6 +5269,44 @@ HandlePipeEntry:
          cmp #$a0      
          bcc GetWNum               ;if player at middle, but not too far right, use offset and skip
          inx                       ;otherwise increment for last pipe
+         ges_3: ;$F009
+lda WRAM_Timer+1
+bmi ges_3_dont_add
+lda WarpZoneControl
+bne ges_3_warp_zone
+lda WRAM_Timer
+clc
+adc #25
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+
+ges_3_dont_add:
+jmp Enter_RedrawAll
+
+ges_3_warp_zone:
+lda IntervalTimerControl
+cmp #13
+bcc warp_zone_framerule_lost
+clc
+adc #139
+adc WRAM_Timer
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+jmp Enter_RedrawAll
+
+warp_zone_framerule_lost:
+adc #160
+adc WRAM_Timer
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+jmp Enter_RedrawAll
+
 GetWNum: ldy WarpZoneNumbers,x     ;get warp zone numbers
          dey                       ;decrement for use as world number
          sty WorldNumber           ;store as world number and offset
@@ -6028,7 +6082,27 @@ DrawFlagSetTimer:
 
 IncrementSFTask2:
       inc StarFlagTaskControl   ;move onto next task
-      jmp Enter_RedrawAll
+      jmp sftc_inc
+
+sftc_inc: ;$F0B9
+    lda WRAM_Timer+1
+bmi stfc_inc_dont_add
+lda StarFlagTaskControl
+cmp #5
+bcc stfc_inc_dont_add
+
+worldendtimer_6_add:
+lda WRAM_Timer
+clc
+adc #5
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+
+stfc_inc_dont_add:
+jmp Enter_RedrawAll
+
 
 DelayToAreaEnd:
       jsr DrawStarFlag          ;do sub to draw star flag
@@ -10565,8 +10639,21 @@ ChkGERtn: lda GameEngineSubroutine   ;get number of game engine routine running
           bne ExCSM
           lda #$02
           sta GameEngineSubroutine   ;otherwise set sideways pipe entry routine to run
-          jsr Enter_RedrawAll
+          jsr ges_2
           rts                        ;and leave
+          ges_2: ;$F055
+lda WRAM_Timer+1
+bmi ges_2_dont_add
+lda WRAM_Timer
+clc
+adc #25
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+
+ges_2_dont_add:
+jmp Enter_RedrawAll
 
 ;--------------------------------
 ;$02 - high nybble of vertical coordinate from block buffer
@@ -10590,9 +10677,25 @@ HandleAxeMetatile:
        sta OperMode_Task   ;reset secondary mode
        lda #$02
        sta OperMode        ;set primary mode to autoctrl mode
-       jsr Enter_RedrawAll
+       jsr opermode_2
        lda #$18
        sta Player_X_Speed  ;set horizontal speed and continue to erase axe metatile
+       opermode_2: ;$F09A
+lda WRAM_Timer+1
+bmi opermode_2_dont_add
+lda WorldNumber
+cmp #7
+bcc opermode_2_dont_add
+lda WRAM_Timer
+sbc #3
+sta WRAM_Timer
+lda WRAM_Timer+1
+sbc #0
+sta WRAM_Timer+1
+
+opermode_2_dont_add:
+jmp Enter_RedrawAll
+
 ErACM: ldy $02             ;load vertical high nybble offset for block buffer
        lda #$00            ;load blank metatile
        sta ($06),y         ;store to remove old contents from block buffer
@@ -10662,8 +10765,7 @@ VineCollision:
       lda Player_Y_Position     ;check player's vertical coordinate
       cmp #$20                  ;for being in status bar area
       bcs PutPlayerOnVine       ;branch if not that far up
-      lda #$01
-      sta GameEngineSubroutine  ;otherwise set to run autoclimb routine next frame
+      jsr ges_1
 
 PutPlayerOnVine:
          lda #$03                ;set player state to climbing
@@ -10694,6 +10796,25 @@ SetVXPl: ldy PlayerFacingDir     ;get current facing direction, use as offset
          adc ClimbPLocAdder-1,y  ;add depending on facing location
          sta Player_PageLoc      ;store as player's page location
 ExPVne:  rts                     ;finally, we're done!
+.byte $ff
+ges_1: ;$F06E
+lda #$01
+sta GameEngineSubroutine  ;otherwise set to run autoclimb routine next frame
+lda WRAM_Timer+1
+bmi ges_1_dont_add
+
+ges_7_add:
+lda WRAM_Timer
+clc
+adc #25
+sta WRAM_Timer
+lda WRAM_Timer+1
+adc #0
+sta WRAM_Timer+1
+
+ges_1_dont_add:
+rts
+
 
 ;--------------------------------
 
