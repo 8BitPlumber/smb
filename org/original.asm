@@ -30,18 +30,13 @@ ColdBoot:    jsr InitializeMemory         ;clear memory using pointer in Y
 
              jsr Enter_PracticeInit
 
-             lda #CHR_ORG_SPR
-             ldy WRAM_IsContraMode
+             ldx #CHR_ORG_SPR
+             lda WRAM_IsContraMode
              beq @not_peach
-             lda #CHR_PEACH_SPR
+             ldx #CHR_PEACH_SPR
 @not_peach:
-             ldx #CHR_ORG_BG
-             ldy WRAM_CharSet
-             cpy #2
-             bne @not_lost
-             ldx #CHR_ORG_BG_ALTFONT
-@not_lost:
-             jsr SetChrBanksFromAX
+             ldy #CHR_ORG_BG
+             jsr SetChrBanksFromXY
 
              lda #%00001111
              sta SND_MASTERCTRL_REG       ;enable all sound channels except dmc
@@ -50,29 +45,57 @@ ColdBoot:    jsr InitializeMemory         ;clear memory using pointer in Y
              jsr MoveAllSpritesOffscreen
              jsr InitializeNameTables     ;initialize both name tables
              inc DisableScreenFlag        ;set flag to disable screen output
+             lda #%10                               ; make sure exram is writable
+             sta MMC5_ExRamMode                     ;
+             BankJSR BANK_COMMON, ClearTopStatusBar ; and clear the statusbar area
              lda Mirror_PPU_CTRL_REG1
              ora #%10000000               ;enable NMIs
              jsr WritePPUReg1
-EndlessLoop: jmp EndlessLoop              ;endless loop, need I say more?
-
+             cli
+EndlessLoop:
+      jmp EndlessLoop              ;endless loop, need I say more?
 
 ;-----------------------------------------------------------------
 
 MACRO_ThrowFrameImpl
 
+StatusbarChrSet:
+      .byte CHR_STATUSBAR_ORG, CHR_STATUSBAR_ORG, CHR_STATUSBAR_LL
+
 NonMaskableInterrupt:
+               lda #$44
+               sta MMC5_Nametables
+               lda NameTableSelect
+               sta IRQNameTableSelect
+               lda HorizontalScroll
+               sta IRQHorizontalScroll
                lda Mirror_PPU_CTRL_REG1  ;disable NMIs in mirror reg
-               and #%01111111            ;save all other bits
+               and #%01111110            ;save all other bits
+               ora #%00010000
                sta Mirror_PPU_CTRL_REG1
-               and #%01111110            ;alter name table address to be $2800
                sta PPU_CTRL_REG1         ;(essentially $2000) but save other bits
-               lda Mirror_PPU_CTRL_REG2  ;disable OAM and background display by default
-               and #%11100110
-               ldy DisableScreenFlag     ;get screen disable flag
-               bne ScreenOff             ;if set, used bits as-is
-               lda Mirror_PPU_CTRL_REG2  ;otherwise reenable bits and save them
+               ldy DisableScreenFlag
+               bne SkipIRQ
+               lda #$1F                  ;set interrupt scanline
+               sta MMC5_SLCompare
+               inc IRQAckFlag            ;reset flag to wait for next IRQ
+               ldy WRAM_CharSet
+               lda StatusbarChrSet,y
+               tay
+               sty MMC5_CHRBank+4        ;switch to statusbar chr
+               iny
+               sty MMC5_CHRBank+5        ;switch to statusbar chr
+               lda #$80
+               sta MMC5_SLIRQ            ;reset IRQ
+SkipIRQ:
+               lda Mirror_PPU_CTRL_REG2
+               and #%11100110            ;disable OAM and background display by default
+               ldy DisableScreenFlag     ;if screen disabled, skip this
+               bne ScrnSwch
+               lda Mirror_PPU_CTRL_REG2       ;otherwise reenable bits and save them
                ora #%00011110
-ScreenOff:     sta Mirror_PPU_CTRL_REG2  ;save bits for later but not in register at the moment
+ScrnSwch:
+               sta Mirror_PPU_CTRL_REG2  ;save bits for later but not in register at the moment
                and #%11100111            ;disable screen for now
                sta PPU_CTRL_REG2
                ldx PPU_STATUS            ;reset flip-flop and reset scroll registers to zero
@@ -86,14 +109,6 @@ ScreenOff:     sta Mirror_PPU_CTRL_REG2  ;save bits for later but not in registe
                lda #$02                  ;perform spr-ram DMA access on $0200-$02ff
                sta SPR_DMA
 
-               lda WRAM_PracticeFlags
-               and #PF_EnableInputDisplay
-               beq DrawBuffer            ;if input display not enabled, don't print it
-               lda #<WRAM_StoredInputs   ;otherwise set indirect at $00 to WRAM stored inputs
-               sta $00
-               lda #>WRAM_StoredInputs
-               sta $01
-               jsr UpdateScreen          ;update input display
 DrawBuffer:    ldx VRAM_Buffer_AddrCtrl  ;load control for pointer to buffer contents
                lda VRAM_AddrTable_Low,x  ;set indirect at $00 to pointer
                sta $00
@@ -112,6 +127,13 @@ InitBuffer:    ldx VRAM_Buffer_Offset,y
                sta VRAM_Buffer_AddrCtrl  ;reinit address control to $0301
                lda Mirror_PPU_CTRL_REG2  ;copy mirror of $2001 to register
                sta PPU_CTRL_REG2
+               lda DisableScreenFlag
+               bne :+
+               lda #%00
+               sta MMC5_ExRamMode
+               lda #$AA
+               sta MMC5_Nametables
+:              cli
 
                jsr Enter_PracticeOnFrame
 
@@ -142,45 +164,31 @@ PauseSkip:
                bne SkipSprite0
                lda Sprite0HitDetectFlag  ;check for flag here
                beq SkipSprite0
-Sprite0Clr:
-               lda PPU_STATUS            ;wait for sprite 0 flag to clear, which will
-               and #%01000000            ;not happen until vblank has ended
-               bne Sprite0Clr
                lda GamePauseStatus       ;if in pause mode, do not bother with sprites at all
                and #3
                bne Sprite0Hit
                jsr MoveSpritesOffscreen
                jsr SpriteShuffler
 Sprite0Hit:
-               lda PPU_STATUS            ;do sprite #0 hit detection
-               and #%01000000
-               beq Sprite0Hit
-               ldy #$14                  ;small delay, to wait until we hit horizontal blank time
-HBlankDelay:
-               dey
-               bne HBlankDelay
 SkipSprite0:
-               lda HorizontalScroll      ;set scroll registers from variables
-               sta PPU_SCROLL_REG
-               lda VerticalScroll
-               sta PPU_SCROLL_REG
-               lda Mirror_PPU_CTRL_REG1  ;load saved mirror of $2000
-               pha
-               sta PPU_CTRL_REG1
                lda GamePauseStatus       ;if in pause mode, do not perform operation mode stuff
                and #3
                bne SkipMainOper
                jsr OperModeExecutionTree ;otherwise do one of many, many possible subroutines
 SkipMainOper:
-               jsr Enter_RedrawUserVars
-               lda PPU_STATUS            ;reset flip-flop
-               pla
-               ora #%10000000            ;reactivate NMIs
-               sta PPU_CTRL_REG1
-               lda GamePauseStatus
-               and #$FD
-               sta GamePauseStatus
-               rti                       ;we are done until the next frame!
+WaitForIRQ:
+   lda IRQAckFlag            ;wait for IRQ
+   bne WaitForIRQ
+   jsr Enter_RunPendingWrites
+   lda PPU_STATUS
+   lda Mirror_PPU_CTRL_REG1       ;reenable NMIs 
+   ora #$80
+   sta Mirror_PPU_CTRL_REG1       ;then park it at endless loop until next NMI
+   sta PPU_CTRL_REG1
+   lda GamePauseStatus
+   and #%11111101
+   sta GamePauseStatus
+   rti
 
 ;-------------------------------------------------------------------------------------
 ;$00 - vram buffer address table low, also used for pseudorandom bit
@@ -273,7 +281,7 @@ TitleScreenMode:
       .word RunTitleScreen
 
 IsBigWorld:
-  .byte 1, 1, 0, 1, 0, 0, 1, 0
+  .byte 1, 1, 0, 1, 0, 0, 1, 0, 0
 
 RunTitleScreen:
     jsr Enter_PracticeTitleMenu
@@ -493,7 +501,7 @@ DecNumTimer:  dec FloateyNum_Timer,x       ;decrement value here
               bne LoadNumTiles             ;branch ahead if not found
               lda #Sfx_ExtraLife
               sta Square2SoundQueue        ;and play the 1-up sound
-LoadNumTiles: jsr Enter_RedrawFrameNumbers
+LoadNumTiles: StatusbarUpdate SB_Frame
 ChkTallEnemy: ldy Enemy_SprDataOffset,x    ;get OAM data offset for enemy object
               lda Enemy_ID,x               ;get enemy object identifier
               cmp #Spiny
@@ -595,7 +603,9 @@ SetupIntermediate:
 ;-------------------------------------------------------------------------------------
 
 WriteBottomStatusLine:
-      jsr Enter_RedrawSockTimer
+      lda IntervalTimerControl
+      sta WRAM_CurrentEntranceITC
+      StatusbarUpdate SB_SockTimer
       jmp IncSubtask
 
 ;-------------------------------------------------------------------------------------
@@ -613,10 +623,14 @@ NoTimeUp: inc ScreenRoutineTask     ;increment control task 2 tasks forward
 ;-------------------------------------------------------------------------------------
 
 WriteTopStatusLine:
-    jsr Enter_WritePracticeTop
+    StatusbarUpdate SB_Init
     jmp IncSubtask
 
 DisplayIntermediate:
+               lda #0
+               sta PPU_SCROLL_REG
+               sta PPU_SCROLL_REG
+               sta NameTableSelect
                lda OperMode                 ;check primary mode of operation
                beq NoInter                  ;if in title screen mode, skip this
                cmp #GameOverModeValue       ;are we in game over mode?
@@ -707,12 +721,10 @@ IncModeTask_B: inc OperMode_Task  ;move onto next mode
 
 GameText:
 WorldLivesDisplay:
-  .byte $21, $cd, $07, $24, $24 ; cross with spaces used on
-  .byte $29, $24, $24, $24, $24 ; lives display
-  .byte $21, $4b, $09, $20, $18 ; "WORLD  - " used on lives display
-  .byte $1b, $15, $0d, $24, $24, $28, $24
-  .byte $22, $0c, $47, $24 ; possibly used to clear time up
-  .byte $23, $dc, $01, $ba ; attribute table data for crown if more than 9 lives
+  .byte $21, $4b, $09, "WORLD X-X" ; "WORLD  - " used on lives display
+  .byte $21, $cf, $03, $29, $24, $CE ; lives display
+  .byte $23, $d2, $03, $AA, $AA, $AA
+  .byte $23, $db, $02, $AA, $FE
   .byte $ff
 
 OnePlayerTimeUp:
@@ -732,7 +744,7 @@ WarpZoneWelcome:
 
 WarpZoneNumbers:
   .byte $04, $03, $02, $00         ; warp zone numbers, note spaces on middle
-  .byte $24, $05, $24, $00         ; zone, partly responsible for
+  .byte $09, $05, $09, $00         ; zone, partly responsible for
   .byte $08, $07, $06, $00         ; the minus world
 
 GameTextOffsets:
@@ -769,14 +781,12 @@ EndGameText:   lda #$00                 ;put null terminator at end
                bcs PrintWarpZoneNumbers
                dex                      ;are we printing the world/lives display?
                bne WriteTextDone      ;if not, branch to check player's name
-               lda #$ce
-PutLives:      sta VRAM_Buffer1+7
-               ldy WorldNumber          ;write world and level numbers (incremented for display)
+PutLives:      ldy WorldNumber          ;write world and level numbers (incremented for display)
                iny                      ;to the buffer in the spaces surrounding the dash
-               sty VRAM_Buffer1+19
+               sty VRAM_Buffer1+9
                ldy LevelNumber
                iny
-               sty VRAM_Buffer1+21      ;we're done here
+               sty VRAM_Buffer1+11      ;we're done here
 WriteTextDone:
                rts
 
@@ -1280,10 +1290,8 @@ ClearVRLoop: sta VRAM_Buffer1-1,y      ;clear buffer at $0300-$03ff
              lda #$ff
              sta BalPlatformAlignment  ;initialize balance platform assignment flag
              lda ScreenLeft_PageLoc    ;get left side page location
-             lsr Mirror_PPU_CTRL_REG1  ;shift LSB of ppu register #1 mirror out
-             and #$01                  ;mask out all but LSB of page location
-             ror                       ;rotate LSB of page location into carry then onto mirror
-             rol Mirror_PPU_CTRL_REG1  ;this is to set the proper PPU name table
+             and #$01
+             sta NameTableSelect
              jsr GetAreaMusic          ;load proper music into queue
              lda #$38                  ;load sprite shuffle amounts to be used later
              sta SprShuffleAmt+2
@@ -1297,12 +1305,6 @@ ShufAmtLoop: lda DefaultSprOffsets,x
              dex                       ;do this until they're all set
              bpl ShufAmtLoop
              ldy #$03                  ;set up sprite #0
-ISpr0Loop:   lda Sprite0Data,y
-             sta Sprite_Data,y
-             dey
-             bpl ISpr0Loop
-             jsr DoNothing2            ;these jsrs doesn't do anything useful
-             jsr DoNothing1
              inc Sprite0HitDetectFlag  ;set sprite #0 check flag
              inc OperMode_Task         ;increment to next task
              rts
@@ -1411,7 +1413,7 @@ ChkSwimE: ldy AreaType                ;if level not water-type,
           jsr SetupBubble             ;otherwise, execute sub to set up air bubbles
 SetPESub: lda #$07                    ;set to run player entrance subroutine
           sta GameEngineSubroutine    ;on the next frame of game engine
-          jsr Enter_RedrawFrameNumbers
+          StatusbarUpdate SB_Frame
           rts
 
 ;-------------------------------------------------------------------------------------
@@ -1426,6 +1428,7 @@ HalfwayPageNybbles:
       .byte $66, $60
       .byte $65, $70
       .byte $00, $00
+      .byte $4a, $24
 
 PlayerLoseLife:
              inc DisableScreenFlag    ;disable screen and sprite 0 check
@@ -2797,6 +2800,7 @@ EnemyDataAddrLow:
       .byte <E_GroundArea13, <E_GroundArea14, <E_GroundArea15, <E_GroundArea16, <E_GroundArea17, <E_GroundArea18
       .byte <E_GroundArea19, <E_GroundArea20, <E_GroundArea21, <E_GroundArea22, <E_UndergroundArea1
       .byte <E_UndergroundArea2, <E_UndergroundArea3, <E_WaterArea1, <E_WaterArea2, <E_WaterArea3
+      .byte $00, $00, $00, $00, $00, $00, <E_MWELevel1
 
 EnemyDataAddrHigh:
       .byte >E_CastleArea1, >E_CastleArea2, >E_CastleArea3, >E_CastleArea4, >E_CastleArea5, >E_CastleArea6
@@ -2805,6 +2809,7 @@ EnemyDataAddrHigh:
       .byte >E_GroundArea13, >E_GroundArea14, >E_GroundArea15, >E_GroundArea16, >E_GroundArea17, >E_GroundArea18
       .byte >E_GroundArea19, >E_GroundArea20, >E_GroundArea21, >E_GroundArea22, >E_UndergroundArea1
       .byte >E_UndergroundArea2, >E_UndergroundArea3, >E_WaterArea1, >E_WaterArea2, >E_WaterArea3
+      .byte $00, $00, $00, $00, $00, $00, >E_MWELevel1
 
 AreaDataHOffsets:
       .byte $00, $03, $19, $1c
@@ -3679,8 +3684,6 @@ ExitEng:      rts                        ;and after all that, we're finally done
 ;-------------------------------------------------------------------------------------
 
 ScrollHandler:
-			DoUpdateSockHash
-
             lda Player_X_Scroll       ;load value saved here
             clc
             adc Platform_X_Scroll     ;add value used by left/right platforms
@@ -3718,12 +3721,8 @@ ScrollScreen:
               lda ScreenLeft_PageLoc
               adc #$00                  ;add carry to page location for left
               sta ScreenLeft_PageLoc    ;side of the screen
-              and #$01                  ;get LSB of page location
-              sta $00                   ;save as temp variable for PPU register 1 mirror
-              lda Mirror_PPU_CTRL_REG1  ;get PPU register 1 mirror
-              and #%11111110            ;save all bits except d0
-              ora $00                   ;get saved bit here and save in PPU register 1
-              sta Mirror_PPU_CTRL_REG1  ;mirror to be used to set name table later
+              and #$01                   ;get LSB of page location
+              sta NameTableSelect        ;save as name table select for later use
               jsr GetScreenPosition     ;figure out where the right side is
               lda #$08
               sta ScrollIntervalTimer   ;set scroll timer (residual, not used elsewhere)
@@ -4377,7 +4376,7 @@ ProcJumping:
            bpl InitJS                 ;if player's vertical speed motionless or down, branch
            jmp X_Physics              ;if timer at zero and player still rising, do not swim
 InitJS:    
-           jsr Enter_RedrawFrameNumbers
+           StatusbarUpdate SB_Frame
            lda #$20                   ;set jump/swim timer
            sta JumpSwimTimer
            ldy #$00                   ;initialize vertical force and dummy variable
@@ -5127,8 +5126,17 @@ MiscLoopBack:
 ;-------------------------------------------------------------------------------------
 
 GiveOneCoin:
+    ;inc CoinTally          ;increment player's coin amount
+    ;lda CoinTally
+    ;cmp #100               ;does player have 100 coins yet?
+    ;bne AddToScore         ;if not, skip all of this
+    ;lda #$00
+    ;sta CoinTally          ;otherwise, reinitialize coin amount
+    ;lda #Sfx_ExtraLife
+    ;sta Square2SoundQueue  ;play 1-up sound    
 AddToScore:
-    jmp Enter_RedrawFrameNumbers
+    StatusbarUpdate SB_Frame
+    rts
 
 EnemyAddrHOffsets:
       .byte $1f, $06, $1c, $00
@@ -5248,8 +5256,14 @@ HandlePipeEntry:
 GetWNum: ldy WarpZoneNumbers,x     ;get warp zone numbers
          dey                       ;decrement for use as world number
          sty WorldNumber           ;store as world number and offset
+         cpy #World9               ;are we going to the minus world?
+         bne @getpointer           ;if not, get area pointer normally
+         lda WRAM_MinusWorld       ;if we are, check which minus world we're going to
+         bne @storepointer         ;if NES minus world, change area pointer manually
+@getpointer:
          ldx WorldAddrOffsets,y    ;get offset to where this world's area offsets are
          lda AreaAddrOffsets,x     ;get area offset based on world offset
+@storepointer:
          sta AreaPointer           ;store area offset here to be used to change areas
          sta WRAM_LevelAreaPointer
          PF_SetToLevelEnd_A
@@ -6072,6 +6086,7 @@ SkipByte:     dey
               pla
               sta BANK_SELECTED
               lda #00
+              ldx #0
               rts
 
 ;-------------------------------------------------------------------------------------
@@ -6137,6 +6152,8 @@ WritePPUReg1:
 ;-------------------------------------------------------------------------------------
 
 InitializeNameTables:
+              lda #$44
+              sta MMC5_Nametables
               lda PPU_STATUS            ;reset flip-flop
               lda Mirror_PPU_CTRL_REG1  ;load mirror of ppu reg $2000
               ora #%00010000            ;set sprites for first 4k and background for second 4k
@@ -6216,6 +6233,7 @@ WorldAddrOffsets:
       .byte World3Areas-AreaAddrOffsets, World4Areas-AreaAddrOffsets
       .byte World5Areas-AreaAddrOffsets, World6Areas-AreaAddrOffsets
       .byte World7Areas-AreaAddrOffsets, World8Areas-AreaAddrOffsets
+      .byte World9Areas-AreaAddrOffsets
 
 AreaAddrOffsets:
 World1Areas: .byte $25, $29, $c0, $26, $60
@@ -6226,6 +6244,7 @@ World5Areas: .byte $2a, $31, $26, $62
 World6Areas: .byte $2e, $23, $2d, $60
 World7Areas: .byte $33, $29, $01, $27, $64
 World8Areas: .byte $30, $32, $21, $65
+World9Areas: .byte $09, $27, $44, $01
 
 ;-------------------------------------------------------------------------------------
 
@@ -12004,7 +12023,9 @@ EnemyAnimTimingBMask:
       .byte $08, $18
 
 JumpspringFrameOffsets:
-      .byte $18, $19, $1a, $19, $18
+      .byte $18, $19
+E_MWELevel1:
+      .byte $1a, $19, $18
 
 EnemyGfxHandler:
       lda Enemy_Y_Position,x      ;get enemy object vertical position
@@ -13889,6 +13910,6 @@ NoHammer: ldx ObjectOffset         ;get original enemy object offset
 
           .include "utils.inc"
 
-practice_callgate
-control_bank
+practice_callgate BANK_ORG
+control_bank BANK_ORG
 
